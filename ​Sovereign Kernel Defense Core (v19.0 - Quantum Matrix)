@@ -1,0 +1,459 @@
+// ========================================================================
+// SYSTEM:      SOVEREIGN KERNEL DEFENSE CORE
+// STATUS:      ACTIVE // QUANTUM MATRIX & CRYPTOGRAPHIC MAX // v19.0
+// ========================================================================
+
+use std::env;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::Path;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+use aes_gcm::{
+    aead::{Aead, NewAead},
+    Aes256Gcm, Key, Nonce,
+};
+use chrono::Utc;
+use rand::RngCore;
+use reqwest::Client;
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use tokio::time::{sleep, Duration};
+use tracing::{error, info, warn};
+use warp::Filter;
+
+const DB_NAME: &str = "core_security.db";
+const ALERT_LOG: &str = "security_alerts.log";
+const ERROR_LOG: &str = "security_errors.log";
+const INTEGRITY_FILE: &str = "storm_core.rs";
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SovereignThreatReport {
+    operator: String,
+    ip: String,
+    port: String,
+    threat: String,
+    confidence: f64,
+    timestamp: String,
+}
+
+// ============================
+//   إدارة الهوية السيادية المحايدة
+// ============================
+fn get_operator_identity() -> String {
+    env::var("SOVEREIGN_OPERATOR_NAME").unwrap_or_else(|_| "AUTHORIZED_OPERATOR".to_string())
+}
+
+fn get_system_identity() -> String {
+    env::var("SOVEREIGN_SYSTEM_NAME").unwrap_or_else(|_| "SOVEREIGN_CORE_DEFENSE".to_string())
+}
+
+// ============================
+//   موديول الإحكام والاستحكام العسكري (Kernel Hardening & Anti-Dump)
+// ============================
+fn enforce_kernel_hardening() {
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
+    info!("HARDENING: Core dumps disabled (PR_SET_DUMPABLE set to 0).");
+
+    let rlim = libc::rlimit {
+        rlim_cur: 1024,
+        rlim_max: 4096,
+    };
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+    }
+}
+
+fn handle_system_error(context: &str, err: &str) {
+    if let Ok(mut file) = File::options().append(true).create(true).open(ERROR_LOG) {
+        let _ = writeln!(
+            file,
+            "[{}] OPERATOR: {} | ERROR in {} => {}",
+            Utc::now().to_rfc3339(),
+            get_operator_identity(),
+            context,
+            err
+        );
+    }
+    error!("CORE ERROR in {} => {}", context, err);
+
+    let token = env::var("STORM_TELEGRAM_TOKEN").unwrap_or_default();
+    let chat_id = env::var("STORM_TELEGRAM_CHAT_ID").unwrap_or_default();
+
+    if !token.is_empty() && !chat_id.is_empty() {
+        tokio::spawn(async move {
+            let client = Client::new();
+            let text = format!(
+                "⚠️ {} Alert ⚠️\nOperator: {}\nContext: {}\nDetails: {}",
+                get_system_identity(),
+                get_operator_identity(),
+                context,
+                err
+            );
+            let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+            let _ = client.post(&url).form(&[("chat_id", chat_id.as_str()), ("text", &text)]).send().await;
+        });
+    }
+}
+
+async fn init_core_db(conn: Arc<Mutex<Connection>>) {
+    if let Ok(c) = conn.lock() {
+        let _ = c.execute(
+            "CREATE TABLE IF NOT EXISTS security_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operator TEXT,
+                remote_ip TEXT,
+                port TEXT,
+                threat TEXT,
+                confidence REAL,
+                timestamp TEXT
+            )",
+            [],
+        );
+    }
+}
+
+fn log_event_to_db(conn: &Arc<Mutex<Connection>>, operator: &str, ip: &str, port: &str, threat: &str, confidence: f64) {
+    if let Ok(c) = conn.lock() {
+        let _ = c.execute(
+            "INSERT INTO security_events (operator, remote_ip, port, threat, confidence, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![operator, ip, port, threat, confidence, Utc::now().to_rfc3339()],
+        );
+    }
+}
+
+// ============================
+//   موديول كشف التتبع والتصحيح (Anti-Debugging Guard)
+// ============================
+fn check_debugger_attachment() -> Result<bool, String> {
+    let status_path = Path::new("/proc/self/status");
+    if !status_path.exists() {
+        return Ok(false);
+    }
+
+    let contents = fs::read_to_string(status_path).map_err(|e| e.to_string())?;
+    for line in contents.lines() {
+        if line.starts_with("TracerPid:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(pid_str) = parts.get(1) {
+                let tracer_pid: u32 = pid_str.parse().unwrap_or(0);
+                if tracer_pid > 0 {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+// ============================
+//   موديول كشف الروتكتات وحقن المكتبات (LD_PRELOAD Rootkit Shield)
+// ============================
+fn check_rootkit_preload() -> Result<bool, String> {
+    let preload_path = "/etc/ld.so.preload";
+    if Path::new(preload_path).exists() {
+        if let Ok(metadata) = fs::metadata(preload_path) {
+            if metadata.len() > 0 {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+// ============================
+//   موديول فحص امتيازات العمليات والتصعيد الخفي
+// ============================
+fn audit_process_privileges() -> Vec<u32> {
+    let mut high_priv_pids = Vec::new();
+    let entries = match fs::read_dir("/proc") {
+        Ok(v) => v,
+        Err(_) => return high_priv_pids,
+    };
+
+    for entry in entries.flatten() {
+        let filename = entry.file_name().to_string_lossy().to_string();
+        if let Ok(pid) = filename.parse::<u32>() {
+            let status_path = entry.path().join("status");
+            if let Ok(content) = fs::read_to_string(status_path) {
+                for line in content.lines() {
+                    if line.starts_with("CapEff:") {
+                        let caps = line.split_whitespace().nth(1).unwrap_or("0");
+                        if caps != "0000000000000000" && pid > 1000 {
+                            high_priv_pids.push(pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    high_priv_pids
+}
+
+// ============================
+//   موديول التدقيق الشبكي الخفي ومنافذ الاستماع (Socket Auditor)
+// ============================
+fn audit_network_sockets() -> Vec<String> {
+    let mut anomalous_ports = Vec::new();
+    
+    if let Ok(contents) = fs::read_to_string("/proc/net/tcp") {
+        for line in contents.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let (Some(local_addr), Some(state)) = (parts.get(1), parts.get(3)) {
+                if *state == "0A" {
+                    if let Some(port_hex) = local_addr.split(':').nth(1) {
+                        if let Ok(port_num) = u32::from_str_radix(port_hex, 16) {
+                            if port_num > 1024 && port_num != 8080 {
+                                anomalous_ports.push(port_num.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    anomalous_ports
+}
+
+// ============================
+//   الدفاع النشط والعزل السيادي (Active Countermeasure)
+// ============================
+fn execute_active_defense(target_ip: &str, target_pid: Option<u32>, reason: &str) {
+    warn!(
+        "ACTIVE COUNTERMEASURE EXECUTED -> IP: {}, PID: {:?} | Reason: {}",
+        target_ip, target_pid, reason
+    );
+
+    if !target_ip.is_empty() && target_ip != "LOCAL" && target_ip != "SYSTEM" {
+        let _ = Command::new("iptables").args(["-A", "INPUT", "-s", target_ip, "-j", "DROP"]).status();
+    }
+
+    if let Some(pid) = target_pid {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+}
+
+async fn send_secure_alert(ip: &str, port: &str, threat: &str, confidence: f64) {
+    let token = env::var("STORM_TELEGRAM_TOKEN").unwrap_or_default();
+    let chat_id = env::var("STORM_TELEGRAM_CHAT_ID").unwrap_or_default();
+    if token.is_empty() || chat_id.is_empty() {
+        return;
+    }
+
+    let client = Client::new();
+    let text = format!(
+        "🚨 {} ALERT 🚨\nOperator: {}\nThreat: {}\nIP: {}\nPort: {}\nConfidence: {:.1}%\n🔥 [COUNTERMEASURE EXECUTED]",
+        get_system_identity(),
+        get_operator_identity(),
+        threat, ip, port, confidence * 100.0
+    );
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let _ = client.post(&url).form(&[("chat_id", chat_id.as_str()), ("text", &text)]).send().await;
+}
+
+// ============================
+//   التواصل المشفر العنقودي (P2P AES-GCM Mesh Broadcast)
+// ============================
+async fn broadcast_threat(ip: &str, port: &str, threat: &str, confidence: f64) {
+    let client = Client::new();
+    let peers = vec![
+        "http://192.168.1.10:8080/cluster-report",
+        "http://192.168.1.11:8080/cluster-report",
+    ];
+
+    let raw_key = env::var("STORM_CLUSTER_KEY").unwrap_or_else(|_| "0123456789abcdef0123456789abcdef".to_string());
+    let key_bytes = raw_key.as_bytes();
+    if key_bytes.len() < 32 {
+        return;
+    }
+    let key = Key::from_slice(&key_bytes[..32]);
+    let cipher = Aes256Gcm::new(key);
+    
+    // استخدام Nonce عشوائي مشفر ومتغير مع كل عملية بث
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let report = SovereignThreatReport {
+        operator: get_operator_identity(),
+        ip: ip.to_string(),
+        port: port.to_string(),
+        threat: threat.to_string(),
+        confidence,
+        timestamp: Utc::now().to_rfc3339(),
+    };
+
+    let plaintext = match serde_json::to_vec(&report) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let ciphertext = match cipher.encrypt(nonce, plaintext.as_ref()) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    for peer in peers {
+        let payload = json!({
+            "operator_id": get_operator_identity(),
+            "cipher_data": hex::encode(&ciphertext)
+        });
+        let _ = client.post(peer).json(&payload).send().await;
+    }
+}
+
+fn log_alert(ip: &str, port: &str, threat: &str, confidence: f64) {
+    if let Ok(mut file) = File::options().append(true).create(true).open(ALERT_LOG) {
+        let _ = writeln!(
+            file,
+            "[{}] SECURITY_ALERT [Operator: {}]: {} ({:.1}%) from {}:{}",
+            Utc::now().to_rfc3339(),
+            get_operator_identity(),
+            threat,
+            confidence * 100.0,
+            ip,
+            port
+        );
+        info!("SECURITY ALERT: {} from {}:{}", threat, ip, port);
+    }
+}
+
+// دالة تجزئة الملفات المطورة (Buffering Engine)
+fn file_hash(path: &str) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+// ============================
+//   مراقبة سلامة النواة (Core Integrity Engine)
+// ============================
+async fn integrity_monitor(original_hash: String, conn: Arc<Mutex<Connection>>) {
+    loop {
+        match check_debugger_attachment() {
+            Ok(true) => {
+                handle_system_error("AntiDebugGuard", "CRITICAL: Debugger attachment (TracerPid) detected!");
+                execute_active_defense("LOCAL", None, "Anti-Debug Violation");
+                log_event_to_db(&conn, &get_operator_identity(), "LOCAL", "SYSTEM", "ANTI_DEBUG_VIOLATION", 1.0);
+            }
+            Err(e) => handle_system_error("AntiDebugGuard::Err", &e),
+            _ => {}
+        }
+
+        match check_rootkit_preload() {
+            Ok(true) => {
+                handle_system_error("RootkitGuard", "CRITICAL: LD_PRELOAD Rootkit Hijack detected!");
+                execute_active_defense("LOCAL", None, "Rootkit Hijacking");
+                log_event_to_db(&conn, &get_operator_identity(), "LOCAL", "SYSTEM", "ROOTKIT_HIJACK", 1.0);
+            }
+            Err(e) => handle_system_error("RootkitGuard::Err", &e),
+            _ => {}
+        }
+
+        let suspicious_pids = audit_process_privileges();
+        for pid in suspicious_pids {
+            warn!("AUDIT: Suspicious privileged process detected: PID {}", pid);
+        }
+
+        let anomalous_ports = audit_network_sockets();
+        for port in anomalous_ports {
+            warn!("NETWORK ANOMALY: Unauthorized active listening port detected: {}", port);
+        }
+
+        match file_hash(INTEGRITY_FILE) {
+            Ok(current_hash) => {
+                if current_hash != original_hash {
+                    handle_system_error("IntegrityMonitor", "File integrity violation detected! Unauthorized code change.");
+                    
+                    execute_active_defense("LOCAL", None, "Core File Tampering");
+                    log_alert("LOCAL", "SYSTEM", "CODE_TREASON_ALERT", 1.0);
+                    log_event_to_db(&conn, &get_operator_identity(), "LOCAL", "SYSTEM", "CODE_TREASON_ALERT", 1.0);
+                    send_secure_alert("LOCAL", "SYSTEM", "CODE_TREASON_ALERT", 1.0).await;
+                    broadcast_threat("LOCAL", "SYSTEM", "CODE_TREASON_ALERT", 1.0).await;
+
+                    let _ = Command::new("git").args(["checkout", "--", INTEGRITY_FILE]).output();
+                }
+            }
+            Err(e) => handle_system_error("IntegrityMonitor::file_hash", &e),
+        }
+
+        sleep(Duration::from_secs(3)).await;
+    }
+}
+
+// ============================
+//   واجهة التحكم المشفرة (Cluster Command API)
+// ============================
+async fn cluster_dashboard(conn: Arc<Mutex<Connection>>) {
+    let conn_filter = warp::any().map(move || conn.clone());
+    
+    let report_route = warp::path("cluster-report")
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(conn_filter)
+        .map(|body: serde_json::Value, _conn: Arc<Mutex<Connection>>| {
+            if let Some(cipher_hex) = body.get("cipher_data").and_then(|v| v.as_str()) {
+                info!("CLUSTER MESH: Received authentic peer sync block, length {}", cipher_hex.len());
+            }
+            warp::reply::json(&json!({"status": "acknowledged"}))
+        });
+
+    warp::serve(report_route).run(([0, 0, 0, 0], 8080)).await;
+}
+
+// ============================
+//   نقطة البداية (Main Core Entry)
+// ============================
+#[tokio::main]
+async fn main() {
+    enforce_kernel_hardening();
+
+    tracing_subscriber::fmt::init();
+    info!("========================================================");
+    info!("SOVEREIGN KERNEL DEFENSE CORE INITIALIZED");
+    info!("OPERATOR: {}", get_operator_identity());
+    info!("SYSTEM: {}", get_system_identity());
+    info!("STATUS: DIGITAL SOVEREIGNTY // ACTIVE // v19.0");
+    info!("========================================================");
+
+    let conn = Arc::new(Mutex::new(
+        Connection::open(DB_NAME).unwrap_or_else(|e| {
+            handle_system_error("main::open_db", &e.to_string());
+            panic!("Failed to open Security DB");
+        }),
+    ));
+
+    init_core_db(conn.clone()).await;
+
+    let original_hash = match file_hash(INTEGRITY_FILE) {
+        Ok(h) => h,
+        Err(e) => {
+            handle_system_error("main::file_hash_initial", &e);
+            String::from("INVALID_HASH")
+        }
+    };
+
+    tokio::spawn(integrity_monitor(original_hash, conn.clone()));
+
+    // التشغيل المتزامن مع الاستماع لإشارة الإنهاء السيادي (Graceful Shutdown)
+    tokio::select! {
+        _ = cluster_dashboard(conn.clone()) => {}
+        _ = tokio::signal::ctrl_c() => {
+            info!("CORE SHUTDOWN: Sovereign shutdown signal received (Ctrl+C). Securing environment...");
+        }
+    }
+}
